@@ -18,7 +18,7 @@ import logging
 import os
 import sys
 
-from notify import TelegramNotifier
+from notify import TelegramNotifier, renewal_instructions
 from starlink import (SessionExpired, Starlink, StarlinkError, load_session,
                       session_age_days)
 from unifi import UniFi, UniFiError, load_api_key
@@ -75,9 +75,12 @@ def main() -> int:
         if age is not None:
             log.info("starlink: session is %.1f days old (warn at %.0f)", age, warn_after)
             if age >= warn_after:
-                problems.append(
-                    f"Starlink session is {age:.0f} days old; the cookie lasts "
-                    f"about a year — re-capture it before it expires")
+                token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+                chat = os.environ.get("TELEGRAM_CHAT_ID", "")
+                if token and chat:
+                    TelegramNotifier(token, chat).send(
+                        renewal_instructions(age, os.environ.get("DEPLOY_DIR", "")))
+                log.warning("session is %.0f days old — renewal instructions sent", age)
     except SessionExpired as e:
         problems.append(f"STARLINK SESSION EXPIRED — log in again: {e}")
     except (StarlinkError, KeyError) as e:

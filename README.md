@@ -207,7 +207,10 @@ instead. PRs welcome if your situation differs.
 leaves you on throttled standby instead of upgrading — slow internet, not no
 internet.
 
-Re-capture with `./scripts/install-session.sh` and restart the container.
+When it is nearly due, the Telegram alert carries the whole procedure — where
+to log in, which DevTools tab, the exact right-click, and the two commands
+including your `DEPLOY_DIR`. You should not have to remember any of it eleven
+months later, or come back here to look it up.
 
 ## Going back to standby
 

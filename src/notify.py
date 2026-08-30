@@ -37,6 +37,31 @@ TELEGRAM_API = "https://api.telegram.org"
 Decision = Literal["approved", "denied", "pending", "expired"]
 
 
+def renewal_instructions(age_days: float, deploy_dir: str = "") -> str:
+    """The whole renewal procedure, in the alert itself.
+
+    This fires roughly once a year. Nobody remembers a procedure they last ran
+    eleven months ago, and "re-capture the session" is not a procedure — so the
+    message carries every step, including where the deployment lives.
+    """
+    where = deploy_dir or "<your deployment directory>"
+    return (
+        f"🔑 *Starlink session needs renewing*\n"
+        f"Captured {age_days:.0f} days ago; the cookie lasts about a year.\n\n"
+        f"*Takes ~2 minutes:*\n"
+        f"1. Log in at starlink.com/account in a browser\n"
+        f"2. Open DevTools → *Network* tab, type `api/` in the filter\n"
+        f"3. Reload the page, then right-click any `/api/webagg/...` row\n"
+        f"4. Choose *Copy → Copy as cURL*\n"
+        f"5. Run: `cd {where} && ./scripts/install-session.sh`\n"
+        f"6. Restart: `docker compose up -d --force-recreate`\n\n"
+        f"The script reads your clipboard, checks the session is complete and "
+        f"writes it over ssh — nothing lands in your shell history.\n\n"
+        f"_No rush: failover is unaffected. A dead session only means an outage "
+        f"leaves you on standby at ~0.5 Mbps instead of upgrading._"
+    )
+
+
 class TelegramNotifier:
     def __init__(self, bot_token: str, chat_id: str, timeout: int = 20) -> None:
         if not bot_token or not chat_id:

@@ -36,7 +36,7 @@ import sys
 import time
 from typing import Any
 
-from notify import ApprovalServer, TelegramNotifier
+from notify import ApprovalServer, TelegramNotifier, renewal_instructions
 from starlink import (SessionExpired, Starlink, StarlinkError, load_session,
                       session_age_days)
 from unifi import UniFi, load_api_key
@@ -75,6 +75,9 @@ class Watchdog:
         self.canary_interval = int(env("CANARY_INTERVAL_HOURS", "24")) * 3600
         # Measured cookie life is ~365 days; warn with a month to spare.
         self.session_warn_days = float(env("SESSION_WARN_DAYS", "330"))
+        # Named in the renewal alert so the message is self-contained a year
+        # from now, when nobody remembers where this is deployed.
+        self.deploy_dir = env("DEPLOY_DIR", "")
 
         # Day of month to return the line to Standby Mode; 0 disables. Set it to
         # your billing-reset day minus a few days of slack. You already paid the
@@ -179,12 +182,7 @@ class Watchdog:
             age = session_age_days()
             if age is not None and age >= self.session_warn_days:
                 log.warning("Starlink session is %.1f days old", age)
-                self.tg.send(
-                    f"🔑 *Starlink session is {age:.0f} days old.*\n"
-                    f"The cookie is good for about a year from capture, so it "
-                    f"is nearly due. Re-capture it, or the plan switch will "
-                    f"stop working.\n\n"
-                    f"_Everything else is fine; failover itself is unaffected._")
+                self.tg.send(renewal_instructions(age, self.deploy_dir))
         except (StarlinkError, KeyError) as e:
             log.error("CANARY FAILED: %s", e)
             self.tg.send(
