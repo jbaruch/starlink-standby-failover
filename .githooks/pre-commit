@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Block credential material from being committed, by CONTENT not filename.
+#
+# .gitignore covers the files we know about. This covers the ones we don't:
+# a renamed capture, a debug dump, a paste into a scratch file, `git add -f`.
+# This project handles a live Starlink session, a UniFi API key and a Telegram
+# bot token, so the blast radius of one slip is real.
+#
+# Versioned in the repo, so enable it after cloning with:
+#   git config core.hooksPath .githooks
+
+set -euo pipefail
+
+# Patterns are deliberately anchored on the VALUE, not the key name, so that
+# documentation mentioning "Starlink.Com.Sso" in prose does not trip them.
+patterns=(
+  'Starlink\.Com\.Sso=[A-Za-z0-9%._-]{20}'
+  'Starlink\.Com\.Access\.V1=[A-Za-z0-9%._-]{40}'
+  'XSRF-TOKEN=[A-Za-z0-9%._-]{20}'
+  '[0-9]{9,10}:AA[A-Za-z0-9_-]{30,}'          # Telegram bot token
+  'X-API-KEY["'"'"']?\s*[:=]\s*["'"'"']?[A-Za-z0-9_-]{24,}'
+  'BEGIN (RSA|OPENSSH|EC|PGP) PRIVATE KEY'
+)
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+[ -z "$staged" ] && exit 0
+
+failed=0
+while IFS= read -r file; do
+  [ -z "$file" ] && continue
+  # Skip binaries.
+  if ! git diff --cached -- "$file" | head -1 | grep -q . ; then continue; fi
+  blob=$(git show ":$file" 2>/dev/null || true)
+  [ -z "$blob" ] && continue
+  for p in "${patterns[@]}"; do
+    if printf '%s' "$blob" | grep -qE "$p"; then
+      echo "BLOCKED: $file looks like it contains a live credential" >&2
+      echo "         (matched /$p/)" >&2
+      failed=1
+    fi
+  done
+done <<< "$staged"
+
+if [ "$failed" -ne 0 ]; then
+  cat >&2 <<'EOF'
+
+Refusing to commit. Credentials belong in wan-failover/secrets/ (gitignored,
+0600) and are installed with ./install-session.sh or ./install-unifi-key.sh.
+
+If this is a false positive — a doc example, a test fixture — either shorten the
+sample value or commit with --no-verify, deliberately.
+EOF
+  exit 1
+fi
+exit 0

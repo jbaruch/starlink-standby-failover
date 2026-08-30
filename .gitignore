@@ -1,0 +1,19 @@
+# Credentials — never commit, public repo or not.
+secrets/
+.env
+!.env.example
+
+# Runtime state and outputs
+state.json
+recon-output.json
+*.log
+
+# Local tooling
+.venv/
+__pycache__/
+*.pyc
+
+# Editor / OS
+.DS_Store
+._*
+*.bak

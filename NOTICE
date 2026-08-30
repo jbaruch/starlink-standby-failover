@@ -1,0 +1,8 @@
+starlink-standby-failover
+Copyright 2026 the starlink-standby-failover contributors
+
+Licensed under the Apache License, Version 2.0.
+
+This project is not affiliated with, endorsed by, or sponsored by SpaceX,
+Starlink, or Ubiquiti Inc. It interacts with an undocumented consumer API
+that may change or break at any time.

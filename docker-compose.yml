@@ -1,0 +1,37 @@
+services:
+  starlink-standby-failover:
+    build:
+      context: .
+      args:
+        # Must match the host owner of ./secrets. `id -u` / `id -g`.
+        APP_UID: "${APP_UID:-1000}"
+        APP_GID: "${APP_GID:-1000}"
+    image: starlink-standby-failover:latest
+    container_name: starlink-standby-failover
+    restart: unless-stopped
+
+    env_file:
+      - ./.env
+
+    ports:
+      # Approval links, when APPROVAL_MODE=confirm. Must be reachable from your
+      # phone (LAN, VPN, Tailscale). Do NOT expose this to the internet.
+      - "8788:8788"
+
+    volumes:
+      - state:/data
+      # Credentials are files, never environment variables. A captured Starlink
+      # cookie header contains `$`, and docker compose interpolates `$` inside
+      # env_file values — it mangles the string and warns about undefined
+      # variables. A mounted file is interpolated by nothing, and stays out of
+      # `docker inspect`.
+      - ./secrets:/run/secrets:ro
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  state:
