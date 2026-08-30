@@ -23,6 +23,7 @@ os.environ.update({
     "MAX_SPEND_USD": "200", "UNIFI_API_KEY": "x",
     "STARLINK_SESSION": "Starlink.Com.Sso=y", "TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "c",
     "APPROVAL_MODE": "auto", "REVERT_DAY_OF_MONTH": "3",
+    "BILLING_RESET_DAY": "6",
 })
 
 import watchdog  # noqa: E402
@@ -52,6 +53,8 @@ def build(state: dict | None = None) -> watchdog.Watchdog:
         sf.write_text(json.dumps(state))
     wd = watchdog.Watchdog.__new__(watchdog.Watchdog)
     wd.revert_day = 3
+    wd.billing_reset_day = 6
+    wd.wan_names = {"wan1": "WAN1", "wan2": "WAN2"}
     wd._starlink_session = "Starlink.Com.Sso=y"
     wd.state = watchdog.Watchdog._load_state(wd)
     wd._save_state = lambda: None  # type: ignore[method-assign]
@@ -83,23 +86,58 @@ def main() -> int:
         check("silent on the 2nd", attempted(build()), False)
 
         FakeDate._today = datetime.date(2026, 9, 6)
-        check("silent on the 6th (billing day, too late)", attempted(build()), False)
+        check("silent on the 6th (billing day itself)", attempted(build()), False)
+
+        # THE HOLE a single fixed day leaves: an outage switches the plan on the
+        # 4th or 5th; with a one-day trigger it would never be reverted and you
+        # would be charged a full month at plan rate.
+        FakeDate._today = datetime.date(2026, 9, 4)
+        check("fires on the 4th (inside the window)", attempted(build()), True)
+        FakeDate._today = datetime.date(2026, 9, 5)
+        check("fires on the 5th (inside the window)", attempted(build()), True)
+
+        # Window arithmetic, including the wrap case (reset on the 1st).
+        w = build()
+        check("window: 3..6 excludes 2", w.in_revert_window(2), False)
+        check("window: 3..6 includes 3", w.in_revert_window(3), True)
+        check("window: 3..6 includes 5", w.in_revert_window(5), True)
+        check("window: 3..6 excludes 6", w.in_revert_window(6), False)
+        w.revert_day, w.billing_reset_day = 27, 1
+        check("wrapped window includes 28", w.in_revert_window(28), True)
+        check("wrapped window excludes 15", w.in_revert_window(15), False)
+        w.revert_day, w.billing_reset_day = 3, 6
 
         # Once per month, not once per 30-second tick.
         FakeDate._today = datetime.date(2026, 9, 3)
         wd = build()
         first = attempted(wd)
         second = attempted(wd)
-        check("first run on the 3rd fires", first, True)
-        check("second run same day does NOT re-fire", second, False)
+        check("first attempt of the day fires", first, True)
+        check("second attempt same day does NOT re-fire", second, False)
+
+        # A failed attempt must be retried the NEXT day, not dropped for the
+        # month — the whole point of the window.
+        FakeDate._today = datetime.date(2026, 9, 4)
+        check("retries the next day after a failure", attempted(wd), True)
+
+        # Confirmed standby ends it for the month.
+        wd.state["last_revert_month"] = "2026-09"
+        FakeDate._today = datetime.date(2026, 9, 5)
+        check("stops once the month is confirmed done", attempted(wd), False)
 
         # A new month re-arms it.
         wd.state["last_revert_month"] = "2026-08"
+        wd.state["last_revert_attempt"] = None
         FakeDate._today = datetime.date(2026, 9, 3)
         check("new month re-arms", attempted(wd), True)
 
-        # Records the month it ran, so a restart mid-month does not re-fire.
-        check("records the month", wd.state["last_revert_month"], "2026-09")
+        # Never yank a plan while the primary is still down.
+        wd2 = build()
+        wd2.state["down_since"] = 1.0
+        FakeDate._today = datetime.date(2026, 9, 4)
+        attempted(wd2)
+        check("does not revert during an active outage",
+              wd2.state.get("last_revert_month"), None)
     finally:
         watchdog.datetime.date = real_date  # type: ignore[misc]
 

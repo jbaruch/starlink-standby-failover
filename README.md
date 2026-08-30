@@ -167,9 +167,23 @@ docker compose run --rm starlink-standby-failover python revert_to_standby.py
 docker exec starlink-standby-failover touch /data/DISABLED   # stand down
 ```
 
-The canary also runs in-process every `CANARY_INTERVAL_HOURS` and alerts Telegram
-when the chain breaks — cron is not required, which matters on NAS platforms
-that deny crontab to unprivileged users.
+The canary also runs in-process every `CANARY_INTERVAL_HOURS` and alerts
+Telegram when the chain breaks. No cron required — one fewer thing to install,
+and some NAS platforms make installing a crontab awkward for unprivileged
+users even where cron itself runs fine.
+
+## Going back to standby
+
+Set `REVERT_DAY_OF_MONTH` and `BILLING_RESET_DAY` and the line is returned to
+Standby Mode before your bill renews. It is attempted **every day in that
+window**, not on one fixed day: a switch triggered after a single trigger day
+would never be reverted and would cost a full month at plan rate. It retries
+daily until standby is confirmed, and will not yank the plan while your primary
+is still down.
+
+Note the money only flows one way — the prorated remainder you paid is not
+refundable, so reverting early donates it. Revert late, but not so late that a
+queued standby misses the boundary.
 
 ## Proving the write path before you need it
 

@@ -76,6 +76,10 @@ class Watchdog:
         # donates it — but leaving it to the last day risks a queued standby
         # missing the billing boundary and costing a full month at plan rate.
         self.revert_day = int(env("REVERT_DAY_OF_MONTH", "0"))
+        # Day your Starlink bill renews. With it set, the revert is attempted
+        # every day from REVERT_DAY_OF_MONTH up to (not including) this day,
+        # instead of only once — see in_revert_window().
+        self.billing_reset_day = int(env("BILLING_RESET_DAY", "0"))
 
         self.approval_mode = env("APPROVAL_MODE", "auto").lower()
         if self.approval_mode not in ("confirm", "auto"):
@@ -105,7 +109,7 @@ class Watchdog:
     DEFAULT_STATE: dict[str, Any] = {
         "down_since": None, "notified_down": False, "approval_id": None,
         "last_resume_at": None, "last_estimate": None, "last_canary": 0,
-        "last_revert_month": None,
+        "last_revert_month": None, "last_revert_attempt": None,
     }
 
     def _load_state(self) -> dict[str, Any]:
@@ -146,9 +150,10 @@ class Watchdog:
     def _maybe_canary(self) -> None:
         """Periodic proof the whole chain still works, run in-process.
 
-        In-process rather than cron because some NAS platforms deny crontab to
-        unprivileged users, and an always-on process schedules just as well. It
-        also keeps the Starlink session warm as a side effect.
+        In-process rather than cron so there is one fewer thing to install and
+        one fewer thing to forget. Some NAS platforms also make installing a
+        crontab awkward for unprivileged users even when cron itself runs.
+        Keeps the Starlink session warm as a side effect.
         """
         last = self.state.get("last_canary") or 0
         if time.time() - last < self.canary_interval:
@@ -170,31 +175,64 @@ class Watchdog:
                 f"standby at ~0.5 Mbps. What would not happen is the switch to a "
                 f"full plan, so an outage means slow internet, not no internet._")
 
-    def _maybe_revert(self) -> None:
-        """On REVERT_DAY_OF_MONTH, put the line back on Standby Mode.
+    def in_revert_window(self, day: int) -> bool:
+        """Is `day` inside [REVERT_DAY_OF_MONTH, BILLING_RESET_DAY)?
 
-        Runs at most once per calendar month. A no-op when already on standby,
-        which is the normal case — this only really fires in a month where an
-        outage actually triggered a switch.
+        A WINDOW, not a single day, because a single day leaves a hole: an
+        outage that switches the plan *after* the revert day but before the
+        billing boundary would never be reverted, and you would be charged a
+        full month at plan rate. Checking every day in the run-up closes it.
+
+        Wraps when the revert day falls after the reset day (e.g. reset on the
+        1st, revert on the 27th).
         """
         if not self.revert_day:
-            return
+            return False
+        if not self.billing_reset_day:
+            return day == self.revert_day
+        if self.revert_day < self.billing_reset_day:
+            return self.revert_day <= day < self.billing_reset_day
+        return day >= self.revert_day or day < self.billing_reset_day
+
+    def _maybe_revert(self) -> None:
+        """Put the line back on Standby Mode ahead of the billing boundary.
+
+        Attempts once per day across the whole window, and only marks the month
+        done once standby is actually confirmed — so a failed or queued revert
+        is retried tomorrow instead of being silently dropped for the month.
+
+        Never reverts while the primary is still down: you are paying for the
+        plan precisely because you need it right now.
+        """
         today = datetime.date.today()
-        month = f"{today.year}-{today.month:02d}"
-        if today.day != self.revert_day or self.state.get("last_revert_month") == month:
+        if not self.in_revert_window(today.day):
             return
-        self.state["last_revert_month"] = month
+        month = f"{today.year}-{today.month:02d}"
+        if self.state.get("last_revert_month") == month:
+            return
+        stamp = today.isoformat()
+        if self.state.get("last_revert_attempt") == stamp:
+            return
+        self.state["last_revert_attempt"] = stamp
         self._save_state()
 
         try:
             sl = Starlink(self._starlink_session)
             sub = sl.subscription()
             if sub["isStandby"] or sub["isStandbyPending"]:
-                log.info("revert day: already standby (pending=%s), nothing to do",
+                log.info("revert window: already standby (pending=%s), nothing to do",
                          sub["isStandbyPending"])
+                self.state["last_revert_month"] = month
+                self._save_state()
                 return
 
-            log.warning("revert day: line is on %s — returning to standby",
+            # Do not yank a plan we are actively relying on.
+            if self.state.get("down_since") is not None:
+                log.warning("revert window: %s still down — keeping the paid plan",
+                            self.primary)
+                return
+
+            log.warning("revert window: line is on %s — returning to standby",
                         sub["productId"])
             sl.back_to_standby(sub["serviceLineNumber"])
             after = sl.subscription()
@@ -202,11 +240,17 @@ class Watchdog:
                       else "standby PENDING" if after["isStandbyPending"]
                       else f"still {after['productId']}")
             log.warning("revert result: %s", result)
+            if after["isStandby"] or after["isStandbyPending"]:
+                self.state["last_revert_month"] = month
+                self._save_state()
+            else:
+                log.error("revert did not take — will retry tomorrow if the "
+                          "window is still open")
             self.tg.send(
                 f"🌙 *Back to Standby Mode.*\n"
                 f"Was on `{sub['productId']}`, now: {result}.\n"
-                f"_Reverted on day {self.revert_day} of the month, ahead of your "
-                f"billing reset, to leave slack._")
+                f"_Reverted ahead of your billing reset on day "
+                f"{self.billing_reset_day or '?'}, to leave slack._")
         except (StarlinkError, KeyError) as e:
             log.error("REVERT FAILED: %s", e)
             self.tg.send(
@@ -442,9 +486,10 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001 - cosmetic only, never fatal
         log.warning("could not read WAN names (%s) — using WAN1/WAN2", e)
     log.info("watchdog up: primary=%s backup=%s poll=%ds debounce=%ds "
-             "tripwire=$%.2f dry_run=%s mode=%s revert_day=%s",
+             "tripwire=$%.2f dry_run=%s mode=%s revert_window=%s",
              wd.primary, wd.backup, wd.poll_seconds, wd.debounce_seconds,
-             wd.max_spend, wd.dry_run, wd.approval_mode, wd.revert_day or "off")
+             wd.max_spend, wd.dry_run, wd.approval_mode,
+             f"{wd.revert_day}..{wd.billing_reset_day}" if wd.revert_day else "off")
     while True:
         try:
             wd.run_once()
