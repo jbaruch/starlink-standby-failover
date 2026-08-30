@@ -19,7 +19,8 @@ import os
 import sys
 
 from notify import TelegramNotifier
-from starlink import SessionExpired, Starlink, StarlinkError, load_session
+from starlink import (SessionExpired, Starlink, StarlinkError, load_session,
+                      session_age_days)
 from unifi import UniFi, UniFiError, load_api_key
 
 log = logging.getLogger("canary")
@@ -39,7 +40,7 @@ def main() -> int:
                   password=os.environ.get("UNIFI_PASSWORD", ""))
         u.login()
         state = u.wan_state()
-        log.info("unifi: wan1(Fiber)=%s wan2(Starlink)=%s",
+        log.info("unifi: primary up=%s backup up=%s",
                  state["wan1_up"], state["wan2_up"])
         if not state["wan2_up"]:
             problems.append("Starlink WAN2 is down — no failover path at all")
@@ -67,6 +68,16 @@ def main() -> int:
         option = sl.plan_option(sub["serviceLineNumber"], target)
         log.info("starlink: %s would cost $%.2f today",
                  option["name"], option["prorated"])
+
+        # Nothing can renew the login automatically. Say so BEFORE it dies.
+        age = session_age_days()
+        warn_after = float(os.environ.get("SESSION_WARN_DAYS", "12"))
+        if age is not None:
+            log.info("starlink: session is %.1f days old (warn at %.0f)", age, warn_after)
+            if age >= warn_after:
+                problems.append(
+                    f"Starlink session is {age:.0f} days old and cannot be "
+                    f"renewed automatically — re-capture it before it expires")
     except SessionExpired as e:
         problems.append(f"STARLINK SESSION EXPIRED — log in again: {e}")
     except (StarlinkError, KeyError) as e:

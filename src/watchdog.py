@@ -37,7 +37,8 @@ import time
 from typing import Any
 
 from notify import ApprovalServer, TelegramNotifier
-from starlink import SessionExpired, Starlink, StarlinkError, load_session
+from starlink import (SessionExpired, Starlink, StarlinkError, load_session,
+                      session_age_days)
 from unifi import UniFi, load_api_key
 
 log = logging.getLogger("wan-watchdog")
@@ -68,7 +69,10 @@ class Watchdog:
         # and could only ever be gated on a worst case.
         self.target_product = env("TARGET_PRODUCT_ID", required=True)
 
-        self.canary_interval = int(env("CANARY_INTERVAL_HOURS", "168")) * 3600
+        # Weekly is too coarse for a credential with a ~15-day life: it can be
+        # dead for six days before you hear about it. Daily by default.
+        self.canary_interval = int(env("CANARY_INTERVAL_HOURS", "24")) * 3600
+        self.session_warn_days = float(env("SESSION_WARN_DAYS", "12"))
 
         # Day of month to return the line to Standby Mode; 0 disables. Set it to
         # your billing-reset day minus a few days of slack. You already paid the
@@ -167,6 +171,18 @@ class Watchdog:
             option = sl.plan_option(sub["serviceLineNumber"], self.target_product)
             log.info("canary OK: standby=%s, %s would cost $%.2f",
                      sub["isStandby"], option["name"], option["prorated"])
+
+            # The login cannot be renewed without a human. Warn ahead of time
+            # rather than discovering it during an outage.
+            age = session_age_days()
+            if age is not None and age >= self.session_warn_days:
+                log.warning("Starlink session is %.1f days old", age)
+                self.tg.send(
+                    f"🔑 *Starlink session is {age:.0f} days old.*\n"
+                    f"It cannot be renewed automatically — 2SV is mandatory and "
+                    f"the auth cookies are HttpOnly. Re-capture it before it "
+                    f"expires, or the plan switch will not happen.\n\n"
+                    f"_Everything else is fine; failover itself is unaffected._")
         except (StarlinkError, KeyError) as e:
             log.error("CANARY FAILED: %s", e)
             self.tg.send(

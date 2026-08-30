@@ -65,6 +65,25 @@ def load_session() -> str:
     return value
 
 
+def session_age_days() -> float | None:
+    """How long ago the session file was written, or None if unknowable.
+
+    This matters because nothing can renew it automatically. `refresh-token`
+    mints short-lived access tokens FROM the SSO cookie but returns no
+    Set-Cookie, so the SSO cookie itself has a fixed lifetime from capture
+    (reported elsewhere as ~15 days; unverified). When it dies, a human must log
+    in again — the auth cookies are HttpOnly and 2SV is mandatory, so there is
+    no way around that. The least we can do is say so before it happens.
+    """
+    path = os.environ.get("STARLINK_SESSION_FILE", "")
+    if not path:
+        return None
+    p = pathlib.Path(path)
+    if not p.exists():
+        return None
+    return (time.time() - p.stat().st_mtime) / 86400.0
+
+
 class SessionExpired(StarlinkError):
     """The stored session is dead. A human must log in again — 2SV is mandatory."""
 

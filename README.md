@@ -172,6 +172,34 @@ Telegram when the chain breaks. No cron required — one fewer thing to install,
 and some NAS platforms make installing a crontab awkward for unprivileged
 users even where cron itself runs fine.
 
+## Credential lifetimes — read this bit
+
+There is **no durable login**, and one of the two credentials cannot be renewed
+by any amount of code.
+
+| Credential | Lifetime | Renewal |
+|---|---|---|
+| Starlink access token | ~15 minutes | Automatic, from the SSO cookie |
+| Starlink SSO cookie | limited (reported ~15 days) | **Manual. A human must log in.** |
+| UniFi API key | whatever you set at creation | Manual; check the Integrations page |
+
+`refresh-token` mints access tokens *from* the SSO cookie and returns no
+`Set-Cookie`, so nothing extends the cookie itself. When it dies, the auth
+cookies are HttpOnly and 2SV is mandatory, so re-capturing means a browser and
+your own hands. There is no way around this short of an enterprise account.
+
+What the tool does about it:
+
+- The canary runs **daily** by default and alerts Telegram the moment the chain
+  breaks.
+- It also warns at `SESSION_WARN_DAYS` (default 12) so you re-capture *before*
+  expiry rather than after.
+- Failover itself is never affected — a dead session means an outage leaves you
+  on throttled standby instead of upgrading, i.e. slow internet rather than no
+  internet.
+
+Re-capture with `./scripts/install-session.sh` and restart the container.
+
 ## Going back to standby
 
 Set `REVERT_DAY_OF_MONTH` and `BILLING_RESET_DAY` and the line is returned to
