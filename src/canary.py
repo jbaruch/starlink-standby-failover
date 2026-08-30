@@ -71,13 +71,13 @@ def main() -> int:
 
         # Nothing can renew the login automatically. Say so BEFORE it dies.
         age = session_age_days()
-        warn_after = float(os.environ.get("SESSION_WARN_DAYS", "12"))
+        warn_after = float(os.environ.get("SESSION_WARN_DAYS", "330"))
         if age is not None:
             log.info("starlink: session is %.1f days old (warn at %.0f)", age, warn_after)
             if age >= warn_after:
                 problems.append(
-                    f"Starlink session is {age:.0f} days old and cannot be "
-                    f"renewed automatically — re-capture it before it expires")
+                    f"Starlink session is {age:.0f} days old; the cookie lasts "
+                    f"about a year — re-capture it before it expires")
     except SessionExpired as e:
         problems.append(f"STARLINK SESSION EXPIRED — log in again: {e}")
     except (StarlinkError, KeyError) as e:

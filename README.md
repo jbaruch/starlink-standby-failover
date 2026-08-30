@@ -62,9 +62,10 @@ write  POST /webagg/v1/public/subscriptions/line/{line}/product/{productId}/upda
    is mandatory and cannot be disabled, but it only challenges at sign-in.
 
 2. Seed a cookie jar from it. Do NOT send a captured `cookie` header verbatim:
-   `Starlink.Com.Access.V1` is short-lived (~15 minutes) and a frozen header
-   re-sends the dead token forever. Measured, same session, seconds apart:
-   frozen header → 401, cookie jar → 200.
+   the token inside `Starlink.Com.Access.V1` lasts 15 minutes, so a frozen
+   header re-sends a dead token forever. Measured, same session, seconds apart:
+   frozen header → 401, cookie jar → 200. (The cookie *container* carries a
+   one-year expiry — do not confuse the two, as this project did for a while.)
 
 3. Refresh with GET /api/auth/auth/refresh-token   (POST and PUT return 405)
    It returns {accessToken, expiresIn, tokenType} and sets NO cookie, so you
@@ -173,44 +174,38 @@ Telegram when the chain breaks. No cron required — one fewer thing to install,
 and some NAS platforms make installing a crontab awkward for unprivileged
 users even where cron itself runs fine.
 
-## Credential lifetimes — read this bit
-
-There is **no durable login**, and one of the two credentials cannot be renewed
-by any amount of code.
+## Credential lifetimes
 
 | Credential | Lifetime | Renewal |
 |---|---|---|
-| Starlink access token | ~15 minutes | Automatic, from the SSO cookie |
-| Starlink SSO cookie | limited (reported ~15 days) | **Manual. A human must log in.** |
+| Starlink access token | 15 minutes | Automatic |
+| Starlink `Starlink.Com.Sso` cookie | **~1 year** | Manual, once a year |
 | UniFi API key | whatever you set at creation | Manual; check the Integrations page |
 
-`refresh-token` mints access tokens *from* the SSO cookie and returns no
-`Set-Cookie`, so nothing extends the cookie itself. When it dies, signing in
-again triggers 2SV, which is mandatory and cannot be disabled.
+The one-year figure is **measured**, read out of a browser profile: captured
+2026-08-29, expires 2027-08-29. Several write-ups (and earlier versions of this
+README) repeat a "~15 day" figure that does not match observation — if you are
+building against this API, check it yourself rather than trusting either of us.
 
-**This is not unautomatable, it is just not automated here.** The cookies being
-HttpOnly is not the obstacle — page JavaScript cannot read them, but browser
-automation can (`context.cookies()` returns HttpOnly cookies; verified). And 2SV
-challenges at *sign-in from a new browser*, not on a schedule, so a headless
-browser with a persistent profile stays logged in and renews itself much as your
-laptop does.
+`refresh-token` mints the 15-minute access tokens from the SSO cookie and
+returns no `Set-Cookie` for it, so nothing extends the cookie — but at a year,
+re-capturing by hand annually is a fair trade rather than a wart. `SESSION_WARN_DAYS`
+(default 330) tells you a month ahead.
 
-A credential-renewal sidecar along those lines is a reasonable addition: log in
-by hand once, then periodically dump fresh cookies into
-`secrets/starlink-session` while the Python client stays unchanged. It costs a
-~400MB Chromium, turns a 4KB file into a profile directory you must protect just
-as carefully, and rests on Starlink's remembered-device state outliving the SSO
-cookie — plausible, but unverified. Not built. PRs welcome if you want it.
+A server-side invalidation can still end a session early — password change,
+logout, a security event. The daily canary catches that and alerts Telegram.
 
-What the tool does about it:
+Could renewal be automated? Yes, though it is not done here. HttpOnly does not
+stop browser automation (`context.cookies()` returns HttpOnly cookies; verified),
+and 2SV challenges at sign-in from a new browser rather than on a schedule, so a
+headless browser with a persistent profile would stay logged in. At a one-year
+cookie life the payoff is small against a ~400MB Chromium and a profile
+directory to protect, which is why this asks you for two minutes once a year
+instead. PRs welcome if your situation differs.
 
-- The canary runs **daily** by default and alerts Telegram the moment the chain
-  breaks.
-- It also warns at `SESSION_WARN_DAYS` (default 12) so you re-capture *before*
-  expiry rather than after.
-- Failover itself is never affected — a dead session means an outage leaves you
-  on throttled standby instead of upgrading, i.e. slow internet rather than no
-  internet.
+**Failover is never affected by any of this.** A dead session means an outage
+leaves you on throttled standby instead of upgrading — slow internet, not no
+internet.
 
 Re-capture with `./scripts/install-session.sh` and restart the container.
 

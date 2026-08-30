@@ -68,16 +68,19 @@ def load_session() -> str:
 def session_age_days() -> float | None:
     """How long ago the session file was written, or None if unknowable.
 
-    This matters because nothing can renew it automatically. `refresh-token`
-    mints short-lived access tokens FROM the SSO cookie but returns no
-    Set-Cookie, so the SSO cookie itself has a fixed lifetime from capture
-    (reported elsewhere as ~15 days; unverified). When it dies, signing in again
-    triggers 2SV, which is mandatory.
+    MEASURED, because third-party write-ups get this wrong: the
+    `Starlink.Com.Sso` cookie carries a **one year** expiry (read straight out
+    of a browser profile: captured 2026-08-29, expires 2027-08-29). The
+    widely-repeated "~15 days" figure does not match observation.
 
-    This is automatable in principle — browser automation can read HttpOnly
-    cookies, and 2SV only challenges at sign-in, so a headless browser with a
-    persistent profile would renew itself. It is simply not done here. Until it
-    is, the least we can do is say so before the session dies.
+    `refresh-token` mints short-lived (15 minute) access tokens FROM the SSO
+    cookie and returns no Set-Cookie for it, so nothing extends the cookie
+    itself — but a year is long enough that re-capturing by hand once a year is
+    a reasonable answer rather than a wart.
+
+    The server can still invalidate a session early (password change, logout,
+    security event), which the canary detects. This function exists so you are
+    told the session is aging out *before* an outage discovers it.
     """
     path = os.environ.get("STARLINK_SESSION_FILE", "")
     if not path:

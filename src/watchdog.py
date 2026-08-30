@@ -69,10 +69,12 @@ class Watchdog:
         # and could only ever be gated on a worst case.
         self.target_product = env("TARGET_PRODUCT_ID", required=True)
 
-        # Weekly is too coarse for a credential with a ~15-day life: it can be
-        # dead for six days before you hear about it. Daily by default.
+        # Daily. Not because the login is fragile — it is good for about a
+        # year — but because the endpoints are undocumented and can move under
+        # you at any time, and that is what you want to hear about quickly.
         self.canary_interval = int(env("CANARY_INTERVAL_HOURS", "24")) * 3600
-        self.session_warn_days = float(env("SESSION_WARN_DAYS", "12"))
+        # Measured cookie life is ~365 days; warn with a month to spare.
+        self.session_warn_days = float(env("SESSION_WARN_DAYS", "330"))
 
         # Day of month to return the line to Standby Mode; 0 disables. Set it to
         # your billing-reset day minus a few days of slack. You already paid the
@@ -179,9 +181,9 @@ class Watchdog:
                 log.warning("Starlink session is %.1f days old", age)
                 self.tg.send(
                     f"🔑 *Starlink session is {age:.0f} days old.*\n"
-                    f"It cannot be renewed automatically — 2SV is mandatory and "
-                    f"the auth cookies are HttpOnly. Re-capture it before it "
-                    f"expires, or the plan switch will not happen.\n\n"
+                    f"The cookie is good for about a year from capture, so it "
+                    f"is nearly due. Re-capture it, or the plan switch will "
+                    f"stop working.\n\n"
                     f"_Everything else is fine; failover itself is unaffected._")
         except (StarlinkError, KeyError) as e:
             log.error("CANARY FAILED: %s", e)
