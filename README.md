@@ -57,8 +57,9 @@ write  POST /webagg/v1/public/subscriptions/line/{line}/product/{productId}/upda
 ```
 1. Capture the `cookie:` request header from a logged-in browser (DevTools →
    Network → any /api/ request → Copy as cURL). The auth cookies are HttpOnly,
-   so page JS cannot read them and there is no way to automate this step. 2SV is
-   mandatory and cannot be disabled, but it only challenges at sign-in.
+   so page JS cannot read them — but browser automation can, so this step is
+   manual by choice rather than by necessity (see "Credential lifetimes"). 2SV
+   is mandatory and cannot be disabled, but it only challenges at sign-in.
 
 2. Seed a cookie jar from it. Do NOT send a captured `cookie` header verbatim:
    `Starlink.Com.Access.V1` is short-lived (~15 minutes) and a frozen header
@@ -184,9 +185,22 @@ by any amount of code.
 | UniFi API key | whatever you set at creation | Manual; check the Integrations page |
 
 `refresh-token` mints access tokens *from* the SSO cookie and returns no
-`Set-Cookie`, so nothing extends the cookie itself. When it dies, the auth
-cookies are HttpOnly and 2SV is mandatory, so re-capturing means a browser and
-your own hands. There is no way around this short of an enterprise account.
+`Set-Cookie`, so nothing extends the cookie itself. When it dies, signing in
+again triggers 2SV, which is mandatory and cannot be disabled.
+
+**This is not unautomatable, it is just not automated here.** The cookies being
+HttpOnly is not the obstacle — page JavaScript cannot read them, but browser
+automation can (`context.cookies()` returns HttpOnly cookies; verified). And 2SV
+challenges at *sign-in from a new browser*, not on a schedule, so a headless
+browser with a persistent profile stays logged in and renews itself much as your
+laptop does.
+
+A credential-renewal sidecar along those lines is a reasonable addition: log in
+by hand once, then periodically dump fresh cookies into
+`secrets/starlink-session` while the Python client stays unchanged. It costs a
+~400MB Chromium, turns a 4KB file into a profile directory you must protect just
+as carefully, and rests on Starlink's remembered-device state outliving the SSO
+cookie — plausible, but unverified. Not built. PRs welcome if you want it.
 
 What the tool does about it:
 

@@ -71,9 +71,13 @@ def session_age_days() -> float | None:
     This matters because nothing can renew it automatically. `refresh-token`
     mints short-lived access tokens FROM the SSO cookie but returns no
     Set-Cookie, so the SSO cookie itself has a fixed lifetime from capture
-    (reported elsewhere as ~15 days; unverified). When it dies, a human must log
-    in again — the auth cookies are HttpOnly and 2SV is mandatory, so there is
-    no way around that. The least we can do is say so before it happens.
+    (reported elsewhere as ~15 days; unverified). When it dies, signing in again
+    triggers 2SV, which is mandatory.
+
+    This is automatable in principle — browser automation can read HttpOnly
+    cookies, and 2SV only challenges at sign-in, so a headless browser with a
+    persistent profile would renew itself. It is simply not done here. Until it
+    is, the least we can do is say so before the session dies.
     """
     path = os.environ.get("STARLINK_SESSION_FILE", "")
     if not path:
