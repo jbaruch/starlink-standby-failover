@@ -41,7 +41,7 @@ read   GET /webagg/v2/accounts/service-lines
          → subscription.isStandby, productId, serviceLineNumber
        GET /webagg/v1/public/subscriptions/change-options/{line}
          → currentProduct + changeOptions[].productResponse.proratedPrice
-           ← the live cost gate, and it is a plain GET
+           ← older responses use proratedPrice; current responses have variants
        GET /webagg/v1/shop/address-has-capacity/{addressRefId}
        GET /webagg/v1/demand-surcharge/{line}
 
@@ -51,6 +51,24 @@ write  POST /webagg/v1/public/subscriptions/line/{line}/product/{productId}/upda
          → leaves standby, no body, restores the PREVIOUS plan (unnamed, so its
            price cannot be known in advance — this tool uses /update instead)
 ```
+
+For `product/update`, `{line}` is the **subscription UUID** from
+`subscription.subscriptionReferenceId`, not the `SL-...` service-line number
+used by `change-options`. The body is `{}` for plans without data blocks.
+`?schedule=false` applies an upgrade immediately; `?schedule=true` queues the
+change for the billing boundary. These details were confirmed from the account
+site's JavaScript on 2026-10-02.
+
+Standby's product ID is discovered from the live option with `isStandby=true`.
+The US ID changed from `us-consumer-subscription-standby-mode-0526` to
+`us-standby-mode`; hardcoding the old ID broke the return path. The timing comes
+from that option's `variants[].effectiveTimestamp`, preferring the scheduled
+variant when available.
+
+For an immediate upgrade, the cost gate uses the immediate variant's
+`oneTimeAmount` when variants are present. The product's `proratedPrice` can
+be nonzero even when canceling a pending standby on the current plan costs
+nothing. Older responses without variants still use `proratedPrice`.
 
 ### Auth, which is where the time goes
 
@@ -166,6 +184,7 @@ Leave `DRY_RUN=true` until you have watched it decide correctly at least once.
 ```bash
 docker compose run --rm starlink-standby-failover python canary.py
 docker compose run --rm starlink-standby-failover python revert_to_standby.py
+docker compose run --rm -e REVERT_DRY_RUN=false starlink-standby-failover python revert_to_standby.py
 docker exec starlink-standby-failover touch /data/DISABLED   # stand down
 ```
 
@@ -173,6 +192,11 @@ The canary also runs in-process every `CANARY_INTERVAL_HOURS` and alerts
 Telegram when the chain breaks. No cron required — one fewer thing to install,
 and some NAS platforms make installing a crontab awkward for unprivileged
 users even where cron itself runs fine.
+
+The manual revert previews the live standby option by default. With
+`REVERT_DRY_RUN=false`, it checks that the primary WAN is up, requests standby,
+and polls until the subscription confirms active or pending standby. An HTTP
+success without either state is a failure.
 
 ## Credential lifetimes
 
@@ -221,6 +245,12 @@ would never be reverted and would cost a full month at plan rate. It retries
 daily until standby is confirmed, and will not yank the plan while your primary
 is still down.
 
+The primary's live state is checked before any scheduled revert. `DRY_RUN=true`
+also prevents scheduled standby writes. The job keeps checking once daily
+through the window even after confirming standby, so a later activation in
+the same month still gets reverted; an existing pending standby causes no
+additional write.
+
 Note the money only flows one way — the prorated remainder you paid is not
 refundable, so reverting early donates it. Revert late, but not so late that a
 queued standby misses the boundary.
@@ -236,10 +266,26 @@ docker compose run --rm -e CONFIRM_SPEND=yes \
   starlink-standby-failover python test_write_path.py
 ```
 
-It switches, verifies, switches back, and reports whether the revert applied
-immediately or queued for the next billing boundary — which determines how much
-slack `REVERT_DAY_OF_MONTH` needs. Costs a few dollars if you run it late in a
-cycle. It refuses to spend without `CONFIRM_SPEND=yes`.
+It switches to the configured full plan, verifies that exact plan and that
+standby is no longer pending, then restores standby even if the upgrade fails.
+It checks the primary WAN and the live cost ceiling before writing, and refuses
+to spend without `CONFIRM_SPEND=yes`.
+
+When standby is already active, this tests the actual upgrade. When standby is
+only pending, it tests canceling the queued downgrade and requesting it again;
+the full plan remains active throughout. The output names that distinction.
+Neither case tests physical WAN failover, and a queued return is not proof that
+standby has activated at its future billing boundary.
+
+Live verification on **2026-10-02** passed the pending-standby round trip:
+Roam 100GB was confirmed with no standby queued, then standby was confirmed
+pending again for October 6 at $10/month. The immediate Roam change was quoted
+at $0. This verifies both plan-change requests; an upgrade from active standby
+and physical WAN failover remain unverified. All 97 automated checks passed.
+
+Next planned check: around **2026-11-02**, verify active standby → Roam 100GB →
+standby, unless an earlier outage has already confirmed both directions. Review
+the outage logs and live subscription state before repeating a paid test.
 
 ## A note on guards
 
@@ -257,12 +303,14 @@ switch you wanted.
 
 ```bash
 python -m venv .venv && ./.venv/bin/pip install -r requirements.txt
-cd tests && PYTHONPATH=../src ../.venv/bin/python test_parsing.py
+for test in tests/test_*.py; do PYTHONPATH=src .venv/bin/python "$test" || exit; done
 ```
 
 The fixtures are real captured API responses, trimmed and anonymised. If UniFi
 or Starlink rename a field, they fail — which is the point. A watchdog that
 silently stops understanding its inputs is worse than no watchdog.
+`test_standby.py` covers the October 2026 product ID, subscription UUID,
+scheduling query parameter, verification, and revert gates without live writes.
 
 ## Contributing
 

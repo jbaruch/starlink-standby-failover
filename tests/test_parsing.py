@@ -159,7 +159,7 @@ def main() -> int:
     results.append(check("cheapest is Roam 100GB", rng["min"]["productId"],
                          "us-consumer-subscription-mini-roam-100-0526"))
     results.append(check("standby itself excluded from priced options",
-                         all(o["productId"] != starlink.STANDBY_PRODUCT_ID
+                         all(o["productId"] != CHANGE_OPTIONS["currentProduct"]["productId"]
                              for o in rng["all"]), True))
     results.append(check("all non-standby options priced", len(rng["all"]), 3))
 

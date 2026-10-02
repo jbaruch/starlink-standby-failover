@@ -210,12 +210,12 @@ class Watchdog:
             return self.revert_day <= day < self.billing_reset_day
         return day >= self.revert_day or day < self.billing_reset_day
 
-    def _maybe_revert(self) -> None:
+    def _maybe_revert(self, primary_up: bool) -> None:
         """Put the line back on Standby Mode ahead of the billing boundary.
 
-        Attempts once per day across the whole window, and only marks the month
-        done once standby is actually confirmed — so a failed or queued revert
-        is retried tomorrow instead of being silently dropped for the month.
+        Checks once per day across the whole window. The last confirmed month
+        is bookkeeping, not a gate: a later activation in that same month must
+        still be reverted. Pending standby is observed without another write.
 
         Never reverts while the primary is still down: you are paying for the
         plan precisely because you need it right now.
@@ -223,9 +223,11 @@ class Watchdog:
         today = datetime.date.today()
         if not self.in_revert_window(today.day):
             return
-        month = f"{today.year}-{today.month:02d}"
-        if self.state.get("last_revert_month") == month:
+        if not primary_up:
+            log.warning("revert window: %s still down — keeping the paid plan",
+                        self.primary)
             return
+        month = f"{today.year}-{today.month:02d}"
         stamp = today.isoformat()
         if self.state.get("last_revert_attempt") == stamp:
             return
@@ -242,16 +244,13 @@ class Watchdog:
                 self._save_state()
                 return
 
-            # Do not yank a plan we are actively relying on.
-            if self.state.get("down_since") is not None:
-                log.warning("revert window: %s still down — keeping the paid plan",
-                            self.primary)
+            if self.dry_run:
+                log.warning("DRY_RUN: would return %s to standby", sub["productId"])
                 return
 
             log.warning("revert window: line is on %s — returning to standby",
                         sub["productId"])
-            sl.back_to_standby(sub["serviceLineNumber"])
-            after = sl.subscription()
+            after = sl.back_to_standby(sub["serviceLineNumber"])
             result = ("standby" if after["isStandby"]
                       else "standby PENDING" if after["isStandbyPending"]
                       else f"still {after['productId']}")
@@ -281,10 +280,9 @@ class Watchdog:
             log.warning("kill switch present at %s — standing down", KILL)
             return
 
-        self._maybe_canary()
-        self._maybe_revert()
-
         state = self.unifi.wan_state()
+        self._maybe_canary()
+        self._maybe_revert(primary_up=state["wan1_up"])
         now = state["at"]
 
         if state["wan1_up"]:
@@ -351,7 +349,7 @@ class Watchdog:
             raise
 
         sub = sl.subscription()
-        if not (sub["isStandby"] or sub["isPaused"]):
+        if not (sub["isStandby"] or sub["isPaused"] or sub["isStandbyPending"]):
             log.info("already on a full plan — nothing to switch")
             self._reset_outage()
             return
@@ -456,16 +454,13 @@ class Watchdog:
         line = sub["serviceLineNumber"]
         log.warning("SWITCHING service line %s to %s ($%.2f)",
                     line, self.target_product, cost)
-        result = sl.change_product(line, self.target_product)
-
-        after = sl.subscription()
-        if after["isStandby"]:
-            log.error("plan change returned but line is still standby: %s", result)
-            self.tg.send("🔴 *Plan change returned but the line is still on "
-                         "standby.* Check starlink.com/account.")
-            return
+        after = sl.switch_to_product(line, self.target_product)
 
         self.state["last_resume_at"] = time.time()
+        # A new activation can happen after today's standby check. Re-arm the
+        # revert so it is scheduled even within the same day or month.
+        self.state["last_revert_attempt"] = None
+        self.state["last_revert_month"] = None
         self._reset_outage()
         log.warning("switched: now on %s", after["productId"])
         self.tg.send(

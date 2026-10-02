@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """The monthly revert decides whether you pay $0 or $55. Test the gate.
 
-Billing resets on the 6th. The revert runs on the 3rd, at most once per
-calendar month, and must be a no-op when the line is already on standby (the
+Billing resets on the 6th. The revert checks daily on the 3rd through 5th,
+and must be a no-op when the line is already on standby (the
 normal case — it only really fires in a month where an outage triggered a
 switch).
 
@@ -54,6 +54,7 @@ def build(state: dict | None = None) -> watchdog.Watchdog:
     wd = watchdog.Watchdog.__new__(watchdog.Watchdog)
     wd.revert_day = 3
     wd.billing_reset_day = 6
+    wd.dry_run = False
     wd.wan_names = {"wan1": "WAN1", "wan2": "WAN2"}
     wd._starlink_session = "Starlink.Com.Sso=y"
     wd.state = watchdog.Watchdog._load_state(wd)
@@ -61,7 +62,7 @@ def build(state: dict | None = None) -> watchdog.Watchdog:
     return wd
 
 
-def attempted(wd: watchdog.Watchdog) -> bool:
+def attempted(wd: watchdog.Watchdog, primary_up: bool = True) -> bool:
     """Did _maybe_revert get past the date/month gate and try to talk to Starlink?"""
     calls = []
     orig = watchdog.Starlink
@@ -69,7 +70,7 @@ def attempted(wd: watchdog.Watchdog) -> bool:
         watchdog.StarlinkError("stopped in test"))
     wd.tg = type("T", (), {"send": staticmethod(lambda *a, **k: None)})()
     try:
-        wd._maybe_revert()
+        wd._maybe_revert(primary_up=primary_up)
     finally:
         watchdog.Starlink = orig  # type: ignore[assignment]
     return bool(calls)
@@ -107,7 +108,7 @@ def main() -> int:
         check("wrapped window excludes 15", w.in_revert_window(15), False)
         w.revert_day, w.billing_reset_day = 3, 6
 
-        # Once per month, not once per 30-second tick.
+        # Once per day, not once per 30-second tick.
         FakeDate._today = datetime.date(2026, 9, 3)
         wd = build()
         first = attempted(wd)
@@ -120,10 +121,11 @@ def main() -> int:
         FakeDate._today = datetime.date(2026, 9, 4)
         check("retries the next day after a failure", attempted(wd), True)
 
-        # Confirmed standby ends it for the month.
+        # Keep checking daily: a later activation must not be missed just
+        # because standby was confirmed earlier in this month.
         wd.state["last_revert_month"] = "2026-09"
         FakeDate._today = datetime.date(2026, 9, 5)
-        check("stops once the month is confirmed done", attempted(wd), False)
+        check("rechecks after an earlier standby confirmation", attempted(wd), True)
 
         # A new month re-arms it.
         wd.state["last_revert_month"] = "2026-08"
@@ -135,9 +137,13 @@ def main() -> int:
         wd2 = build()
         wd2.state["down_since"] = 1.0
         FakeDate._today = datetime.date(2026, 9, 4)
-        attempted(wd2)
+        check("does not contact Starlink during an active outage",
+              attempted(wd2, primary_up=False), False)
         check("does not revert during an active outage",
               wd2.state.get("last_revert_month"), None)
+        check("outage does not consume today's revert attempt",
+              wd2.state.get("last_revert_attempt"), None)
+        check("can revert after primary recovers the same day", attempted(wd2), True)
     finally:
         watchdog.datetime.date = real_date  # type: ignore[misc]
 

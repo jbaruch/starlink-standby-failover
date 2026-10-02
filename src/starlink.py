@@ -30,7 +30,6 @@ BASE = "https://www.starlink.com"
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36")
 
-STANDBY_PRODUCT_ID = "us-consumer-subscription-standby-mode-0526"
 REFRESH_PATH = "/api/auth/auth/refresh-token"
 
 
@@ -140,8 +139,11 @@ class Starlink:
               json_body: Any = None, _retried: bool = False) -> Any:
         if path != REFRESH_PATH:
             self._ensure_token()
-        r = self.s.request(method, f"{BASE}{path}", headers=self._headers(mutating),
-                           json=json_body, timeout=self.timeout)
+        try:
+            r = self.s.request(method, f"{BASE}{path}", headers=self._headers(mutating),
+                               json=json_body, timeout=self.timeout)
+        except requests.RequestException as e:
+            raise StarlinkError(f"{method} {path} failed: {e}") from e
 
         # A 401 usually means the short-lived access token aged out, not that
         # the session is gone. Mint a new one from the long-lived SSO cookie
@@ -154,15 +156,20 @@ class Starlink:
             raise SessionExpired(f"{method} {path} rejected: HTTP {r.status_code}")
         if r.status_code == 404:
             raise StarlinkError(f"404 on {path} — SPA endpoints moved, re-run recon")
-        r.raise_for_status()
-        if not r.content:
-            return {}
-        body = r.json()
+        try:
+            body = r.json() if r.content else {}
+        except ValueError as e:
+            raise StarlinkError(
+                f"{method} {path} returned non-JSON (HTTP {r.status_code})") from e
         # The webagg envelope reports failure in-band with HTTP 200 sometimes,
         # and with 422 otherwise. Either way, isValid=False must not look like
         # success to a caller about to spend money.
         if isinstance(body, dict) and body.get("isValid") is False:
             raise StarlinkError(f"{path} returned errors: {body.get('errors')}")
+        try:
+            r.raise_for_status()
+        except requests.RequestException as e:
+            raise StarlinkError(f"{method} {path} rejected: HTTP {r.status_code}") from e
         return body
 
     def _content(self, path: str) -> Any:
@@ -188,14 +195,19 @@ class Starlink:
         Also the canary: if this fails the backup is not armed, and somebody
         needs to know before an outage discovers it for them.
         """
-        r = self.s.get(f"{BASE}{REFRESH_PATH}", timeout=self.timeout)
+        try:
+            r = self.s.get(f"{BASE}{REFRESH_PATH}", timeout=self.timeout)
+        except requests.RequestException as e:
+            raise StarlinkError(f"refresh-token failed: {e}") from e
         if r.status_code in (401, 403):
             raise SessionExpired(
                 f"refresh-token rejected: HTTP {r.status_code} — the SSO cookie "
                 "is dead, re-capture the session")
-        r.raise_for_status()
-
-        body = r.json() if r.content else {}
+        try:
+            r.raise_for_status()
+            body = r.json() if r.content else {}
+        except (requests.RequestException, ValueError) as e:
+            raise StarlinkError(f"refresh-token failed (HTTP {r.status_code})") from e
         token = body.get("accessToken") or ""
         if not token:
             raise StarlinkError(
@@ -215,19 +227,26 @@ class Starlink:
 
     # -- reads (safe, no side effects) --------------------------------------
 
-    def subscription(self) -> dict[str, Any]:
+    def subscription(self, service_line: str | None = None) -> dict[str, Any]:
         content = self._content("/api/webagg/v2/accounts/service-lines")
         results = (content or {}).get("results") or []
         if not results:
             raise StarlinkError("no service lines on this account")
         line = results[0]
+        if service_line is not None:
+            line = next((r for r in results
+                         if r.get("serviceLineNumber") == service_line), None)
+            if line is None:
+                raise StarlinkError(f"service line {service_line} not found on this account")
         sub = line.get("subscription") or {}
         address = line.get("serviceAddress") or {}
         return {
             "serviceLineNumber": line.get("serviceLineNumber"),
+            "subscriptionReferenceId": sub.get("subscriptionReferenceId"),
             "nickname": line.get("nickname"),
             "addressReferenceId": address.get("addressReferenceId") or address.get("referenceId"),
             "productId": sub.get("productId"),
+            "delayedProductId": sub.get("delayedProductId"),
             "isStandby": bool(sub.get("isStandby")),
             "isStandbyPending": bool(sub.get("isStandbyPending")),
             "isPaused": bool(sub.get("isPaused")),
@@ -257,9 +276,19 @@ class Starlink:
             if p.get("productId") != product_id:
                 continue
             cost = p.get("proratedPrice")
+            if "variants" in o:
+                immediate = next((v for v in o.get("variants") or []
+                                  if "effectiveTimestamp" in v
+                                  and v["effectiveTimestamp"] is None), None)
+                if immediate is None:
+                    raise StarlinkError(f"{product_id} has no immediate change option")
+                # The current plan's proratedPrice can be nonzero even when
+                # keeping it (canceling queued standby) costs nothing. The
+                # selected variant is what the account site actually charges.
+                cost = immediate.get("oneTimeAmount")
             if not isinstance(cost, (int, float)):
                 raise StarlinkError(
-                    f"{product_id} has no numeric proratedPrice ({cost!r}) — "
+                    f"{product_id} has no numeric immediate charge ({cost!r}) — "
                     "refusing to price this blind")
             return {"productId": product_id, "name": p.get("name"),
                     "prorated": float(cost), "monthly": p.get("price")}
@@ -311,11 +340,73 @@ class Starlink:
             mutating=True)
 
     def change_product(self, line: str, product_id: str,
-                       data: dict[str, Any] | None = None) -> Any:
+                       data: dict[str, Any] | None = None, *,
+                       schedule: bool = False) -> Any:
+        """Change a service line's plan using its subscription UUID.
+
+        The account site's /line/{id}/product/... endpoint takes a
+        subscriptionReferenceId, despite the path's name. schedule is a query
+        parameter, not a JSON field. Upgrades are immediate by default.
+        """
+        reference = self.subscription(line).get("subscriptionReferenceId")
+        if not reference:
+            raise StarlinkError(f"service line {line} has no subscriptionReferenceId")
         return self._call(
             "POST",
-            f"/api/webagg/v1/public/subscriptions/line/{line}/product/{product_id}/update",
+            f"/api/webagg/v1/public/subscriptions/line/{reference}/product/{product_id}"
+            f"/update?schedule={str(schedule).lower()}",
             mutating=True, json_body=data or {})
 
-    def back_to_standby(self, line: str) -> Any:
-        return self.change_product(line, STANDBY_PRODUCT_ID)
+    def standby_option(self, line: str) -> dict[str, Any]:
+        """Discover the standby product and timing offered to this line.
+
+        The US product ID changed between August and October 2026. The
+        isStandby flag is the source of truth, not a remembered product ID.
+        Prefer the billing-boundary variant, as the account site does.
+        """
+        for option in self.change_options(line).get("changeOptions") or []:
+            product = option.get("productResponse") or {}
+            if product.get("isStandby") is not True or not product.get("productId"):
+                continue
+            variants = option.get("variants") or []
+            if not variants or any("effectiveTimestamp" not in v for v in variants):
+                raise StarlinkError("standby option has no usable timing variants")
+            variant = next((v for v in variants if v["effectiveTimestamp"] is not None),
+                           variants[0])
+            return {"productId": product["productId"], "name": product.get("name"),
+                    "monthly": product.get("price"),
+                    "effectiveTimestamp": variant["effectiveTimestamp"],
+                    "schedule": variant["effectiveTimestamp"] is not None}
+        raise StarlinkError("no standby plan offered on this service line")
+
+    def switch_to_product(self, line: str, product_id: str) -> dict[str, Any]:
+        """Apply the named full plan and verify that no standby remains queued."""
+        self.change_product(line, product_id, schedule=False)
+        for attempt in range(6):
+            after = self.subscription(line)
+            if (after["productId"] == product_id and not after["isStandby"]
+                    and not after["isStandbyPending"] and not after["isPaused"]):
+                return after
+            if attempt < 5:
+                time.sleep(2)
+        raise StarlinkError(
+            f"plan switch was not confirmed for {line}: "
+            f"product={after['productId']}, standby={after['isStandby']}, "
+            f"pending={after['isStandbyPending']}, paused={after['isPaused']}")
+
+    def back_to_standby(self, line: str) -> dict[str, Any]:
+        """Request standby and return its verified current or pending state."""
+        sub = self.subscription(line)
+        if sub["isStandby"] or sub["isStandbyPending"]:
+            return sub
+        option = self.standby_option(line)
+        self.change_product(line, option["productId"], schedule=option["schedule"])
+        for attempt in range(6):
+            after = self.subscription(line)
+            if after["isStandby"] or after["isStandbyPending"]:
+                return after
+            if attempt < 5:
+                time.sleep(2)
+        raise StarlinkError(
+            f"standby request was not confirmed for {line}: "
+            f"product={after['productId']}, pending={after['isStandbyPending']}")
