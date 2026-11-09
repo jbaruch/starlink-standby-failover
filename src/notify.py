@@ -70,24 +70,33 @@ class TelegramNotifier:
         self._chat_id = chat_id
         self.timeout = timeout
 
-    def send(self, text: str, disable_preview: bool = True) -> None:
+    def send(self, text: str, disable_preview: bool = True) -> bool:
         """Fire-and-log. A failed notification must never crash the watchdog —
-        but it must never be silent either."""
-        r = requests.post(
-            f"{TELEGRAM_API}/bot{self._token}/sendMessage",
-            json={
-                "chat_id": self._chat_id,
-                "text": text,
-                "parse_mode": "Markdown",
-                "disable_web_page_preview": disable_preview,
-            },
-            timeout=self.timeout,
-        )
+        but it must never be silent either. Returns whether it was delivered,
+        for callers that want to retry an alert rather than mark it sent."""
+        try:
+            r = requests.post(
+                f"{TELEGRAM_API}/bot{self._token}/sendMessage",
+                json={
+                    "chat_id": self._chat_id,
+                    "text": text,
+                    "parse_mode": "Markdown",
+                    "disable_web_page_preview": disable_preview,
+                },
+                timeout=self.timeout,
+            )
+        except requests.RequestException as e:
+            # The token is part of the URL, and requests quotes the URL in its
+            # connection errors. Keep it out of the logs.
+            log.error("telegram sendMessage failed: %s",
+                      str(e).replace(self._token, "<bot-token>"))
+            return False
         if r.status_code != 200:
             log.error("telegram sendMessage failed: HTTP %s %s",
                       r.status_code, r.text[:300])
-            return
+            return False
         log.info("telegram: sent (%d chars)", len(text))
+        return True
 
 
 class ApprovalServer:

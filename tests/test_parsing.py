@@ -107,8 +107,9 @@ class FakeResponse:
 def build_client() -> unifi.UniFi:
     u = unifi.UniFi(host="192.168.1.1", username="x", password="y")
     u._get = lambda path: GATEWAY if "stat/device" in path else HEALTH  # type: ignore[method-assign]
-    u.s.post = lambda *a, **k: FakeResponse(SYSLOG)  # type: ignore[method-assign]
-    u.s.get = lambda *a, **k: FakeResponse({})  # type: ignore[method-assign]
+    # POST is the system-log query; GET is the CSRF fetch from /api/users/self.
+    u.s.request = lambda method, *a, **k: FakeResponse(  # type: ignore[method-assign]
+        SYSLOG if method == "POST" else {})
     return u
 
 

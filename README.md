@@ -193,6 +193,15 @@ Telegram when the chain breaks. No cron required — one fewer thing to install,
 and some NAS platforms make installing a crontab awkward for unprivileged
 users even where cron itself runs fine.
 
+When the UniFi console itself goes dark — firmware and Network-app updates do
+this for minutes at a time, as connect timeouts, 502s, and 200s carrying HTML
+instead of JSON — the watchdog logs it and skips the tick. An unreadable
+console is never treated as the primary being down: the debounce pauses across
+the blind spot, so a console reboot mid-blip cannot buy you a plan. If it stays
+unreadable for `UNIFI_ALERT_MINUTES`, Telegram hears about it. (It used to exit
+instead and let Docker restart it: 43 restarts in five weeks, every one of them
+a console update.)
+
 The manual revert previews the live standby option by default. With
 `REVERT_DRY_RUN=false`, it checks that the primary WAN is up, requests standby,
 and polls until the subscription confirms active or pending standby. An HTTP
