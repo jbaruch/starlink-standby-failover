@@ -24,6 +24,11 @@ Design notes worth keeping in your head:
 * APPROVAL_MODE=confirm is the third and puts a human on the trigger. Consider
   leaving it off: waiting for a tap means the backup does not fire while you are
   asleep, which is the outage you most want it for.
+* An unreadable console is a skipped tick, never an outage and never an exit.
+  Firmware and Network-app updates make it routine, and "I can't see wan1" is
+  not "wan1 is down": treating it as down could buy a plan because the console
+  rebooted. This process used to exit on it and lean on Docker's restart
+  policy, 43 times in five weeks.
 """
 from __future__ import annotations
 
@@ -39,7 +44,7 @@ from typing import Any
 from notify import ApprovalServer, TelegramNotifier, renewal_instructions
 from starlink import (SessionExpired, Starlink, StarlinkError, load_session,
                       session_age_days)
-from unifi import UniFi, load_api_key
+from unifi import UniFi, UniFiError, UniFiUnavailable, load_api_key
 
 log = logging.getLogger("wan-watchdog")
 
@@ -90,6 +95,11 @@ class Watchdog:
         # instead of only once — see in_revert_window().
         self.billing_reset_day = int(env("BILLING_RESET_DAY", "0"))
 
+        # How long the console may be unreadable before Telegram hears about it.
+        # A Network-app update takes a few minutes; longer than this, a human
+        # should know that nothing is watching the primary.
+        self.unifi_alert_seconds = int(env("UNIFI_ALERT_MINUTES", "15")) * 60
+
         self.approval_mode = env("APPROVAL_MODE", "auto").lower()
         if self.approval_mode not in ("confirm", "auto"):
             raise SystemExit("APPROVAL_MODE must be 'confirm' or 'auto'")
@@ -119,6 +129,7 @@ class Watchdog:
         "down_since": None, "notified_down": False, "approval_id": None,
         "last_resume_at": None, "last_estimate": None, "last_canary": 0,
         "last_revert_month": None, "last_revert_attempt": None,
+        "unifi_down_since": None, "unifi_alerted": False,
     }
 
     def _load_state(self) -> dict[str, Any]:
@@ -153,6 +164,74 @@ class Watchdog:
     @property
     def backup(self) -> str:
         return self.wan_names["wan2"]
+
+    def refresh_wan_names(self) -> None:
+        """Cosmetic, so a failure keeps whatever names we already have."""
+        try:
+            self.wan_names = self.unifi.wan_names()
+        except UniFiError as e:
+            log.warning("could not read WAN names (%s) — keeping %s/%s",
+                        e, self.primary, self.backup)
+
+    # -- console availability --------------------------------------------------
+
+    def _unifi_unreadable(self, err: UniFiError) -> None:
+        """WAN state could not be read this tick. Log it, alert if it drags on.
+
+        Deliberately does NOT touch the outage bookkeeping: an unknown state
+        must never advance the debounce (see _unifi_readable for the clock).
+        """
+        now = time.time()
+        level = logging.WARNING if isinstance(err, UniFiUnavailable) else logging.ERROR
+        log.log(level, "UniFi unreadable, skipping this tick: %s", err)
+        if self.state["unifi_down_since"] is None:
+            self.state["unifi_down_since"] = now
+            self._save_state()
+        dark = now - self.state["unifi_down_since"]
+        if self.state["unifi_alerted"] or dark < self.unifi_alert_seconds:
+            return
+        hint = ("Usually a firmware or Network app update. If it lasts, check "
+                "the console." if isinstance(err, UniFiUnavailable) else
+                "This does not look transient: check credentials and firmware.")
+        reason = str(err).replace("`", "'")[:300]
+        delivered = self.tg.send(
+            f"⚠️ *Can't read WAN state from UniFi* for {_dur(dark)}.\n"
+            f"`{reason}`\n{hint}\n\n"
+            f"_Until it answers, nothing here can see {self.primary} go down, so "
+            f"no plan switch will fire. Failover itself is the gateway's job and "
+            f"does not depend on this watchdog._")
+        if delivered:
+            self.state["unifi_alerted"] = True
+            self._save_state()
+
+    def _unifi_readable(self, now: float) -> None:
+        """First good read after a dark spell: stop the dark clock, and pause —
+        not run — the outage clock across it.
+
+        If the primary was already down when the console went dark, shift
+        `down_since` forward by the blind interval. The debounce then only
+        counts time the primary was actually SEEN down, so a console reboot
+        in the middle of a blip cannot carry it over the line. A real outage
+        still switches; it just waits the full debounce of observed downtime.
+        (The "back after" message then reports observed downtime as well.)
+        """
+        since = self.state["unifi_down_since"]
+        if since is None:
+            return
+        dark = max(0.0, now - since)
+        log.info("UniFi readable again after %s", _dur(dark))
+        if self.state["down_since"] is not None:
+            self.state["down_since"] += dark
+            log.info("not counting %s of blind time toward the %s debounce",
+                     _dur(dark), self.primary)
+        if self.state["unifi_alerted"]:
+            self.tg.send(f"✅ *UniFi is answering again* after {_dur(dark)}. "
+                         f"Watching {self.primary} again.")
+        self.state.update({"unifi_down_since": None, "unifi_alerted": False})
+        self._save_state()
+        # Startup may have fallen back to WAN1/WAN2 because the console was
+        # dark then too; this is the first moment the real names are readable.
+        self.refresh_wan_names()
 
     # -- scheduled work ------------------------------------------------------
 
@@ -275,12 +354,34 @@ class Watchdog:
 
     # -- the loop -----------------------------------------------------------
 
+    def tick(self) -> None:
+        """One loop iteration that survives the failures we expect.
+
+        run_once() already turns an unreadable WAN state into a skipped tick.
+        This is the backstop for any later UniFi call in the tick, and for the
+        Starlink switch path. Anything else is a bug, and a bug should still
+        crash loudly.
+        """
+        try:
+            self.run_once()
+        except UniFiError as e:
+            log.warning("UniFi call failed mid-tick, skipping: %s", e)
+        except StarlinkError as e:
+            log.error("switch path failed: %s", e)
+
     def run_once(self) -> None:
         if KILL.exists():
             log.warning("kill switch present at %s — standing down", KILL)
             return
 
-        state = self.unifi.wan_state()
+        try:
+            state = self.unifi.wan_state()
+        except UniFiError as e:
+            # Skip the whole tick, revert and canary included: the revert
+            # gates on the primary being up, and we do not know that it is.
+            self._unifi_unreadable(e)
+            return
+        self._unifi_readable(state["at"])
         self._maybe_canary()
         self._maybe_revert(primary_up=state["wan1_up"])
         now = state["at"]
@@ -299,7 +400,13 @@ class Watchdog:
         if self.state["down_since"] is None:
             self.state["down_since"] = now
             self._save_state()
-            events = self.unifi.recent_wan_events(since_seconds=900)
+            # Context for the alert, not a decision input. Losing it to a
+            # console hiccup must not also lose the "down" alert itself.
+            try:
+                events: int | str = len(self.unifi.recent_wan_events(since_seconds=900))
+            except UniFiError as e:
+                log.warning("could not read recent WAN events: %s", e)
+                events = "unavailable"
             log.warning("%s DOWN (backup up=%s)", self.primary, state["wan2_up"])
             backup_state = ("up (standby, ~0.5 Mbps)" if state["wan2_up"]
                             else "*also down*")
@@ -308,7 +415,7 @@ class Watchdog:
                 f"{self.backup}: {backup_state}\n"
                 f"Waiting {self.debounce_seconds // 60} min before considering a "
                 f"plan switch.\n"
-                f"_Recent WAN events: {len(events)}_"
+                f"_Recent WAN events: {events}_"
             )
             self.state["notified_down"] = True
             self._save_state()
@@ -491,21 +598,18 @@ def main() -> int:
     )
     wd = Watchdog()
     wd.approvals.start()
-    wd.unifi.login()
-    try:
-        wd.wan_names = wd.unifi.wan_names()
-    except Exception as e:  # noqa: BLE001 - cosmetic only, never fatal
-        log.warning("could not read WAN names (%s) — using WAN1/WAN2", e)
+    # No eager login. The first request logs in on demand, inside the loop's
+    # error handling, so a console that is down at startup costs a skipped
+    # tick instead of an exit — and a restart loop that only ended when the
+    # console came back.
+    wd.refresh_wan_names()
     log.info("watchdog up: primary=%s backup=%s poll=%ds debounce=%ds "
              "tripwire=$%.2f dry_run=%s mode=%s revert_window=%s",
              wd.primary, wd.backup, wd.poll_seconds, wd.debounce_seconds,
              wd.max_spend, wd.dry_run, wd.approval_mode,
              f"{wd.revert_day}..{wd.billing_reset_day}" if wd.revert_day else "off")
     while True:
-        try:
-            wd.run_once()
-        except StarlinkError as e:
-            log.error("switch path failed: %s", e)
+        wd.tick()
         time.sleep(wd.poll_seconds)
 
 

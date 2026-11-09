@@ -39,7 +39,27 @@ FAILOVER_EVENTS = [
 
 
 class UniFiError(RuntimeError):
-    pass
+    """Anything that went wrong talking to the console.
+
+    Every failure in this module surfaces as this type (or the subclass below),
+    so a caller handles exactly one exception, not a zoo of requests errors.
+    """
+
+
+class UniFiUnavailable(UniFiError):
+    """The console is not answering properly right now: unreachable, timing
+    out, 5xx, or serving HTML where JSON belongs.
+
+    Expected, not exotic. Firmware and Network-app updates restart the app
+    behind the console's proxy, and for a few minutes every one of these
+    shows up. On the author's console that was three separate windows in five
+    weeks, and the watchdog used to exit on each one.
+    """
+
+
+def _snippet(r: requests.Response, limit: int = 120) -> str:
+    """The start of a response body, whitespace-collapsed, for error messages."""
+    return repr(" ".join(r.text[:limit * 2].split())[:limit])
 
 
 def load_api_key() -> str:
@@ -91,13 +111,62 @@ class UniFi:
         """No-op when using an API key — there is no session to establish."""
         if self._api_key:
             return
-        r = self.s.post(
-            f"{self.base}/api/auth/login",
-            json={"username": self._username, "password": self._password},
-            timeout=self.timeout,
-        )
+        path = "/api/auth/login"
+        r = self._request("POST", path, json={"username": self._username,
+                                              "password": self._password})
+        if r.status_code >= 500:
+            raise UniFiUnavailable(f"POST {path}: HTTP {r.status_code} {_snippet(r)}")
         if r.status_code != 200:
             raise UniFiError(f"UniFi login failed: HTTP {r.status_code} {r.text[:200]}")
+
+    # -- transport ------------------------------------------------------------
+
+    def _request(self, method: str, path: str, **kwargs: Any) -> requests.Response:
+        """One HTTP round trip. A console that cannot be reached at all —
+        refused, reset, timed out — becomes UniFiUnavailable here."""
+        try:
+            return self.s.request(method, f"{self.base}{path}",
+                                  timeout=self.timeout, **kwargs)
+        except requests.RequestException as e:
+            raise UniFiUnavailable(f"{method} {path}: {type(e).__name__}: {e}") from e
+
+    def _send(self, method: str, path: str, **kwargs: Any) -> requests.Response:
+        """A request with status handling: one re-login on 401 under local-admin
+        auth, 5xx as UniFiUnavailable, any other 4xx as UniFiError."""
+        r = self._request(method, path, **kwargs)
+        if r.status_code == 401 and not self._api_key:
+            self.login()
+            r = self._request(method, path, **kwargs)
+        if r.status_code == 401:
+            if self._api_key:
+                raise UniFiError(
+                    f"401 on {path}. With an API key this usually means the "
+                    "classic API does not accept X-API-KEY on this firmware — "
+                    "run verify_unifi_auth.py, and use a local admin if it says no.")
+            raise UniFiError(f"401 on {path} right after a successful login — "
+                             "the local admin may lack access to this endpoint")
+        if r.status_code >= 500:
+            raise UniFiUnavailable(f"{method} {path}: HTTP {r.status_code} {_snippet(r)}")
+        if r.status_code >= 400:
+            raise UniFiError(f"{method} {path}: HTTP {r.status_code} {_snippet(r)}")
+        return r
+
+    @staticmethod
+    def _json(r: requests.Response, what: str) -> Any:
+        """Parse a body as JSON, or say exactly what came back instead.
+
+        While the Network app boots, the console answers API paths with a 200
+        and its own HTML page. raise_for_status() waves that through, and a bare
+        r.json() dies with "Expecting value: line 1 column 1 (char 0)" — which
+        names neither the endpoint nor the cause.
+        """
+        try:
+            return r.json()
+        except ValueError as e:  # requests' JSONDecodeError is a ValueError
+            ctype = r.headers.get("Content-Type", "no Content-Type")
+            raise UniFiUnavailable(
+                f"{what}: HTTP {r.status_code} but the body is not JSON "
+                f"({ctype}): {_snippet(r)}") from e
 
     def _csrf(self) -> str | None:
         """Any GET hands the CSRF token back in a response header.
@@ -107,28 +176,21 @@ class UniFi:
         """
         if self._api_key:
             return None
-        r = self.s.get(f"{self.base}/api/users/self", timeout=self.timeout)
-        if r.status_code == 401:
-            self.login()
-            r = self.s.get(f"{self.base}/api/users/self", timeout=self.timeout)
-        r.raise_for_status()
+        r = self._send("GET", "/api/users/self")
         token = r.headers.get("x-csrf-token")
         if not token:
             raise UniFiError("no x-csrf-token header on /api/users/self")
         return token
 
     def _get(self, path: str) -> Any:
-        r = self.s.get(f"{self.base}{path}", timeout=self.timeout)
-        if r.status_code == 401 and not self._api_key:
-            self.login()
-            r = self.s.get(f"{self.base}{path}", timeout=self.timeout)
-        if r.status_code == 401:
-            raise UniFiError(
-                f"401 on {path}. With an API key this usually means the classic "
-                "API does not accept X-API-KEY on this firmware — run "
-                "verify_unifi_auth.py, and use a local admin if it says no.")
-        r.raise_for_status()
-        return r.json()
+        return self._json(self._send("GET", path), f"GET {path}")
+
+    def _data(self, path: str) -> Any:
+        """The `data` member that every classic endpoint wraps its payload in."""
+        body = self._get(path)
+        if not isinstance(body, dict) or "data" not in body:
+            raise UniFiError(f"GET {path}: no 'data' in response: {str(body)[:120]!r}")
+        return body["data"]
 
     # -- state --------------------------------------------------------------
 
@@ -138,7 +200,7 @@ class UniFi:
         Detected by shape rather than by model string, so this is not tied to
         one piece of hardware.
         """
-        data = self._get(f"/proxy/network/api/s/{self.site}/stat/device")["data"]
+        data = self._data(f"/proxy/network/api/s/{self.site}/stat/device")
         for d in data:
             if isinstance(d.get("wan1"), dict) and "up" in d["wan1"]:
                 return d
@@ -172,14 +234,13 @@ class UniFi:
     def wan_names(self) -> dict[str, str]:
         """The names you gave your WANs in the console, for readable alerts.
 
-        Falls back to WAN1/WAN2 rather than raising: cosmetic data must never
-        break the thing that keeps you online.
+        Raises UniFiError when the console will not say. Deciding that cosmetic
+        data is not worth failing over is the caller's job, and only the caller
+        knows which names it already has: quietly returning WAN1/WAN2 here would
+        overwrite good names with placeholders after every console blip.
         """
         names = {"wan1": "WAN1", "wan2": "WAN2"}
-        try:
-            data = self._get(f"/proxy/network/api/s/{self.site}/rest/networkconf")["data"]
-        except (UniFiError, requests.RequestException, KeyError):
-            return names
+        data = self._data(f"/proxy/network/api/s/{self.site}/rest/networkconf")
         for n in data:
             if n.get("purpose") != "wan":
                 continue
@@ -192,7 +253,7 @@ class UniFi:
 
     def isp(self) -> dict[str, Any]:
         """Which ISP the gateway currently considers upstream."""
-        data = self._get(f"/proxy/network/api/s/{self.site}/stat/health")["data"]
+        data = self._data(f"/proxy/network/api/s/{self.site}/stat/health")
         wan = next((d for d in data if d.get("subsystem") == "wan"), None)
         if wan is None:
             raise UniFiError("no 'wan' subsystem in stat/health")
@@ -226,13 +287,10 @@ class UniFi:
         csrf = self._csrf()
         if csrf:
             headers["X-CSRF-Token"] = csrf
-        r = self.s.post(
-            f"{self.base}/proxy/network/v2/api/site/{self.site}/system-log/all",
-            json=body, headers=headers, timeout=self.timeout,
-        )
-        r.raise_for_status()
+        path = f"/proxy/network/v2/api/site/{self.site}/system-log/all"
+        r = self._send("POST", path, json=body, headers=headers)
         out = []
-        for e in r.json().get("data", []):
+        for e in self._json(r, f"POST {path}").get("data", []):
             p = e.get("parameters", {})
             out.append({
                 "at": e.get("timestamp", 0) / 1000,
